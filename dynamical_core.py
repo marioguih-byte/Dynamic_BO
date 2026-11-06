@@ -141,7 +141,41 @@ def clear_caches():
         _DS.clear(); _INFO.clear(); _LATLON.clear()
 
 
+_LAT_UNITS = {"degrees_north", "degree_north", "degrees_n", "degree_n", "degreen", "degreesn"}
+_LON_UNITS = {"degrees_east", "degree_east", "degrees_e", "degree_e", "degreee", "degreese"}
+_MEMBER_ALIASES = ("sample", "member", "number", "realization", "ens", "ensemble")
+
+
+def _find_latlon(ds):
+    """Nomes das coordenadas de latitude/longitude, por nome usual ou por atributos CF."""
+    names = list(ds.variables)
+    lower = {n.lower(): n for n in names}
+    lat = next((lower[k] for k in ("latitude", "lat", "latitudes", "nav_lat", "y_lat", "lat_0") if k in lower), None)
+    lon = next((lower[k] for k in ("longitude", "lon", "longitudes", "nav_lon", "x_lon", "lon_0") if k in lower), None)
+    for n in names:
+        a = ds[n].attrs
+        sn, un = str(a.get("standard_name", "")).lower(), str(a.get("units", "")).lower().replace(" ", "")
+        if lat is None and (sn == "latitude" or un in _LAT_UNITS):
+            lat = n
+        if lon is None and (sn == "longitude" or un in _LON_UNITS):
+            lon = n
+    return lat, lon
+
+
 def _normalize(ds):
+    """Padroniza nomes: latitude/longitude, ensemble_member e lead_time em timedelta."""
+    la, lo = _find_latlon(ds)
+    ren = {}
+    if la and la != "latitude" and "latitude" not in ds.variables:
+        ren[la] = "latitude"
+    if lo and lo != "longitude" and "longitude" not in ds.variables:
+        ren[lo] = "longitude"
+    if "ensemble_member" not in ds.dims:
+        alias = next((a for a in _MEMBER_ALIASES if a in ds.dims), None)
+        if alias:
+            ren[alias] = "ensemble_member"
+    if ren:
+        ds = ds.rename(ren)
     if "lead_time" in ds.coords and not np.issubdtype(ds["lead_time"].dtype, np.timedelta64):
         ds = ds.assign_coords(lead_time=pd.to_timedelta(ds["lead_time"].values, unit="s"))
     return ds
@@ -167,6 +201,92 @@ def get_ds(dataset_id, group=None):
     return ds
 
 
+_GROUPS = {}
+
+
+def list_groups(dataset_id):
+    """Subgrupos Zarr do dataset (ex.: níveis de pressão), lidos do próprio store."""
+    with _LOCK:
+        if dataset_id in _GROUPS:
+            return _GROUPS[dataset_id]
+    try:
+        import dynamical_catalog
+        import zarr
+        grp = zarr.open_group(dynamical_catalog.get_store(dataset_id), mode="r")
+        names = sorted(str(k) for k in grp.group_keys())
+    except Exception:
+        names = ["pressure_level"]  # melhor palpite se a listagem não for possível
+    with _LOCK:
+        _GROUPS[dataset_id] = names
+    return names
+
+
+def list_groups_many(ids, workers=6):
+    ids = list(ids)
+    if not ids:
+        return {}
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(ids)))) as ex:
+        return dict(zip(ids, ex.map(list_groups, ids)))
+
+
+def inspect_groups(ids, workers=6):
+    """{grupo: {dataset_id: info}} para todos os subgrupos abríveis dos datasets."""
+    gm = list_groups_many(ids, workers)
+    pairs = [(i, g) for i, gs in gm.items() for g in gs]
+    if not pairs:
+        return {}
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(pairs)))) as ex:
+        res = list(ex.map(lambda p: inspect_dataset(p[0], p[1]), pairs))
+    out = {}
+    for (i, g), v in zip(pairs, res):
+        if v.get("ok"):
+            out.setdefault(g, {})[i] = v
+    return out
+
+
+def structure_report(dataset_id, group=None, max_vars=80):
+    """Texto com dims, coordenadas, variáveis e grupos de um dataset (para diagnóstico)."""
+    lines = [f"dataset: {dataset_id}" + (f"  ·  grupo: {group}" if group else "")]
+    ds = None
+    try:
+        import dynamical_catalog
+        kw = {"chunks": None}
+        if group:
+            kw["group"] = group
+        ds = dynamical_catalog.open(dataset_id, **kw)
+    except Exception as exc:  # noqa
+        lines.append(f"ERRO ao abrir: {type(exc).__name__}: {exc}")
+    if ds is not None:
+        lines.append(f"dims: {dict(ds.sizes)}")
+        lines.append("coordenadas:")
+        for n, v in ds.coords.items():
+            extra = ""
+            if v.ndim == 1 and v.size:
+                try:
+                    extra = f"  [{v.values[0]} … {v.values[-1]}]"
+                except Exception:  # noqa
+                    pass
+            lines.append(f"  - {n}  dims={tuple(v.dims)}  dtype={v.dtype}{extra}")
+        lines.append(f"variáveis ({len(ds.data_vars)}):")
+        for n, v in list(ds.data_vars.items())[:max_vars]:
+            lines.append(f"  - {n}  dims={tuple(v.dims)}  units={v.attrs.get('units', '')}")
+        if len(ds.data_vars) > max_vars:
+            lines.append(f"  … (+{len(ds.data_vars) - max_vars})")
+        la, lo = _find_latlon(ds)
+        lines.append(f"lat/lon reconhecidos: {la!r} / {lo!r}")
+    try:
+        import dynamical_catalog
+        import zarr
+        g = zarr.open_group(dynamical_catalog.get_store(dataset_id), mode="r")
+        if group:
+            g = g[group]
+        lines.append(f"subgrupos no store: {sorted(str(k) for k in g.group_keys())}")
+        lines.append(f"arrays no nível: {sorted(str(k) for k in g.array_keys())[:60]}")
+    except Exception as exc:  # noqa
+        lines.append(f"(não foi possível listar o store: {type(exc).__name__})")
+    return "\n".join(lines)
+
+
 def lead_to_td(lead):
     return pd.to_timedelta(np.asarray(lead.values))
 
@@ -182,7 +302,9 @@ def coord_names(ds):
     for a, b in (("latitude", "longitude"), ("lat", "lon")):
         if a in ds.variables and b in ds.variables:
             return a, b
-    raise KeyError("dataset sem coordenadas latitude/longitude")
+    raise KeyError("dataset sem coordenadas latitude/longitude reconhecíveis "
+                   f"(dims={dict(ds.sizes)}; coords={list(ds.coords)[:12]}; "
+                   f"variáveis={list(ds.data_vars)[:6]}). Use 'Diagnosticar estrutura' para ver o dataset.")
 
 
 def spatial_dims(ds):
@@ -292,8 +414,80 @@ _RATE_FACTORS = {  # unidade -> (mm acumulados) por segundo de intervalo
 }
 
 
+def _norm_units(units):
+    return re.sub(r"\s+", " ", (units or "").lower().strip().replace("**", "^"))
+
+
 def rate_factor(units):
-    return _RATE_FACTORS.get(re.sub(r"\s+", " ", (units or "").lower().strip()))
+    return _RATE_FACTORS.get(_norm_units(units))
+
+
+_PRECIP_TOKENS = ("precip", "rain", "snowfall", "snow_water", "runoff")
+_AMOUNT_UNITS = {"m", "meter", "metre", "meters", "metres", "kg m^-2", "kg m-2", "kg/m2", "kg/m^2", "mm"}
+_PRETTY_UNITS = {"m s-1": "m/s", "m s^-1": "m/s", "w m-2": "W/m²", "w m^-2": "W/m²", "j m-2": "J/m²", "j m^-2": "J/m²",
+                 "kg m-2": "kg/m²", "kg m^-2": "kg/m²", "1": "", "degree_celsius": "°C", "percent": "%"}
+
+
+def _is_precip(name):
+    n = name.lower()
+    return any(t in n for t in _PRECIP_TOKENS) or bool(re.search(r"(?:^|_)tp(?:_|$)", n))  # ex.: imerg_tp_1hr
+
+
+def unit_transform(name, mode, units, wind_unit="m/s"):
+    """Conversão para unidades usadas no Brasil: valor_exibido = valor*scale + offset. -> (scale, offset, rótulo)."""
+    n, u = name.lower(), _norm_units(units)
+    if mode == "accum":
+        return 1.0, 0.0, "mm"
+    if mode == "wind_speed":
+        return WIND_FACTORS[wind_unit], 0.0, wind_unit
+    if mode == "wind_dir":
+        return 1.0, 0.0, "°"
+    f = rate_factor(units)
+    if f is not None and _is_precip(n):                      # taxa -> mm/h
+        return f * 3600.0, 0.0, "mm/h"
+    if _is_precip(n) and u in _AMOUNT_UNITS:                   # lâmina: m -> mm; kg/m² = mm
+        return (1000.0 if u in ("m", "meter", "metre", "meters", "metres") else 1.0), 0.0, "mm"
+    if u in ("k", "kelvin"):
+        return 1.0, -273.15, "°C"
+    if u in ("degree_celsius", "degrees_celsius", "celsius", "degc", "°c"):
+        return 1.0, 0.0, "°C"
+    if u == "pa":
+        return 0.01, 0.0, "hPa"
+    if u in ("hpa", "mb", "mbar", "millibar", "millibars"):
+        return 1.0, 0.0, "hPa"
+    if u in ("m s^-1", "m s-1", "m/s") and n.startswith("wind_") and "direction" not in n:
+        return WIND_FACTORS[wind_unit], 0.0, wind_unit
+    if ("cloud_cover" in n or "cloud_fraction" in n or "relative_humidity" in n) and \
+            u in ("1", "", "(0 - 1)", "(0-1)", "fraction", "0-1"):
+        return 100.0, 0.0, "%"
+    if u in ("percent", "%", "per cent"):
+        return 1.0, 0.0, "%"
+    if u in ("w m^-2", "w m-2", "w/m2", "w/m^2"):
+        return 1.0, 0.0, "W/m²"
+    if u in ("j m^-2", "j m-2", "j/m2", "j/m^2"):               # energia acumulada -> fluxo médio
+        m = re.search(r"_(\d+)hr$", n)
+        return (1.0 / (int(m.group(1)) * 3600.0), 0.0, "W/m²") if m else (1e-6, 0.0, "MJ/m²")
+    if u in ("m^2 s^-2", "m2 s-2"):                            # geopotencial -> altura geopotencial
+        return 1.0 / 9.80665, 0.0, "m"
+    if "visib" in n and u == "m":
+        return 0.001, 0.0, "km"
+    return 1.0, 0.0, _PRETTY_UNITS.get(u, units or "")
+
+
+def unit_label(key, units, wind_unit="m/s"):
+    """Rótulo de unidade exibido para uma chave de variável (original ou derivada)."""
+    k = key.split("/")[-1]
+    if k.endswith("__acum"):
+        return "mm"
+    if k.startswith("wind_speed_"):
+        return wind_unit
+    if k.startswith("wind_direction_"):
+        return "°"
+    return unit_transform(k, "raw", units, wind_unit)[2]
+
+
+def _is_amount_var(name):
+    return bool(re.search(r"_(\d+)hr$", name))
 
 
 def derived_defs(names, units_by_name, kind="forecast"):
@@ -309,8 +503,12 @@ def derived_defs(names, units_by_name, kind="forecast"):
             if f"wind_direction_{h}" not in names:
                 out[f"wind_direction_{h}"] = dict(mode="wind_dir", bases=bases, units="°",
                                                   label=f"Direção do vento, de onde sopra ({h}) · derivada")
-        if ("precip" in n or "rain" in n) and rate_factor(units_by_name.get(n)) and kind in ("forecast", "analysis"):
+        if _is_precip(n) and rate_factor(units_by_name.get(n)) and kind in ("forecast", "analysis"):
             out[f"{n}__acum"] = dict(mode="accum", bases=[n], units="mm", label=f"{n} acumulada (mm) · derivada")
+        elif (_is_precip(n) and rate_factor(units_by_name.get(n)) is None and _is_amount_var(n)
+              and _norm_units(units_by_name.get(n)) in _AMOUNT_UNITS and kind in ("forecast", "analysis")):
+            out[f"{n}__acum"] = dict(mode="accum_amt", bases=[n], units=units_by_name.get(n) or "m",
+                                     label=f"{n} acumulada (mm) · derivada")
     return out
 
 
@@ -452,27 +650,32 @@ def fetch_series(dataset_id, lat, lon, choices, *, init_req=None, horizon_days=7
     choices: lista de chaves ('temperature_2m', 'wind_speed_10m', 'precipitation_surface__acum',
              'pressure_level/temperature', ...). Variáveis ausentes no dataset são puladas.
     """
-    root = get_ds(dataset_id)
-    kind = describe(root)["kind"]
-    if kind == "other":
-        raise ValueError("dataset sem dimensão temporal reconhecida (init_time/lead_time ou time)")
-    tdim = "lead_time" if kind == "forecast" else "time"
-
     by_group = {}
     for ch in choices:
         g, k = parse_choice(ch)
         by_group.setdefault(g, []).append(k)
+    notes, skipped, usable = [], [], {}
+    for g, keys in by_group.items():  # só usa grupos/raiz que abrem e têm grade
+        try:
+            ds_g = get_ds(dataset_id, g)
+            usable[g] = describe(ds_g)
+        except Exception as exc:  # noqa
+            skipped += [f"{g}/{k}" if g else k for k in keys]
+            notes.append(f"{g or 'raiz'}: {type(exc).__name__}: {str(exc)[:110]}")
+    if not usable:
+        raise KeyError("; ".join(notes) or "nenhuma variável utilizável")
+    kind = next(iter(usable.values()))["kind"]
+    if kind == "other":
+        raise ValueError("dataset sem dimensão temporal reconhecida (init_time/lead_time ou time)")
+    tdim = "lead_time" if kind == "forecast" else "time"
 
     out = {"id": dataset_id, "kind": kind, "init": None, "valid": None, "grid": None,
-           "ens": False, "vars": {}, "skipped": []}
+           "ens": False, "vars": {}, "skipped": skipped, "notes": notes}
     init_t = last_t = None
     for g, keys in by_group.items():
-        try:
-            ds = root if g is None else get_ds(dataset_id, g)
-        except Exception as exc:  # grupo inexistente
-            out["skipped"] += [f"{g}/{k}" for k in keys]
-            out.setdefault("notes", []).append(f"grupo '{g}' indisponível: {type(exc).__name__}")
+        if g not in usable:
             continue
+        ds = get_ds(dataset_id, g)
         infos = {v["name"]: v for v in var_infos(ds)}
         units = {n: v["units"] for n, v in infos.items()}
         ddefs = derived_defs(set(infos), units, kind)
@@ -522,6 +725,14 @@ def fetch_series(dataset_id, lat, lon, choices, *, init_req=None, horizon_days=7
                 dtx = xr.DataArray(dt, dims=tdim)
                 da = (pr * fct * dtx).fillna(0).cumsum(tdim)
                 da = da.where(pr.notnull() | (dtx.isnull() & (kind == "forecast")))
+            elif mode == "accum_amt":  # soma das lâminas por intervalo (ex.: 1 h)
+                pr = sub[bases[0]]
+                da = pr.fillna(0).cumsum(tdim).where(pr.notnull())
+                w = re.search(r"_(\d+)hr$", bases[0])
+                med = float(np.nanmedian(dt[1:])) if len(dt) > 1 else float("nan")
+                if w and np.isfinite(med) and abs(med - int(w.group(1)) * 3600.0) > 0.02 * int(w.group(1)) * 3600.0:
+                    out["notes"].append(f"{key}: passo de {med / 3600:g} h difere da janela de {w.group(1)} h; "
+                                        "o acumulado é aproximado")
             else:
                 da = _compute(mode, bases, sub)
             extras = [d for d in da.dims if d not in (tdim, "ensemble_member")]
@@ -540,7 +751,7 @@ def fetch_series(dataset_id, lat, lon, choices, *, init_req=None, horizon_days=7
             for suffix, item in items:
                 arr = _members_first(item, tdim)
                 out["ens"] = out["ens"] or arr.ndim == 2
-                if mode == "accum" and kind == "forecast":
+                if mode in ("accum", "accum_amt") and kind == "forecast":
                     arr[..., 0] = 0.0
                 if not np.isfinite(arr).any():
                     out.setdefault("notes", []).append(f"{key + suffix}: sem dados nesta rodada/período")
@@ -556,16 +767,8 @@ def fetch_series(dataset_id, lat, lon, choices, *, init_req=None, horizon_days=7
 # Conversão/estatística para exibição
 # --------------------------------------------------------------------------
 def display_values(meta, arr, wind_unit="m/s"):
-    u = (meta.get("units") or "").strip()
-    name = meta.get("name", "")
-    f = rate_factor(u)
-    if f is not None and meta.get("mode") == "raw" and ("precip" in name or "rain" in name):
-        return arr * f * 3600.0, "mm/h"
-    if u == "Pa":
-        return arr / 100.0, "hPa"
-    if u in ("m s-1", "m/s", "m s**-1") and name.startswith("wind_") and "direction" not in name:
-        return arr * WIND_FACTORS[wind_unit], wind_unit
-    return arr, u
+    scale, off, label = unit_transform(meta.get("name", ""), meta.get("mode", "raw"), meta.get("units", ""), wind_unit)
+    return arr * scale + off, label
 
 
 def summarize(arr):
@@ -635,7 +838,7 @@ def _select_extra(obj, level, spatial):
 
 
 def fetch_map(dataset_id, choice, bbox, *, init_req=None, lead_h=24.0, time_req=None,
-              member_mode="mean", member_idx=0, level=None, max_cells=600_000):
+              member_mode="mean", member_idx=0, level=None, max_cells=600_000, wind_unit="m/s"):
     """
     Campo 2D em `bbox=(S,N,W,E)`. Para variáveis acumuladas: soma de 0 a lead_h.
     member_mode: mean | std | max | min | member.
@@ -655,7 +858,8 @@ def fetch_map(dataset_id, choice, bbox, *, init_req=None, lead_h=24.0, time_req=
         fct = rate_factor(units.get(bases[0])) if mode == "accum" else None
     else:
         raise KeyError(f"variável '{key}' indisponível para mapa neste dataset")
-    if mode == "accum" and kind != "forecast":
+    acc = mode in ("accum", "accum_amt")
+    if acc and kind != "forecast":
         raise ValueError("precipitação acumulada em mapa só está disponível para datasets de previsão")
 
     sdims = spatial_dims(ds)
@@ -669,7 +873,7 @@ def fetch_map(dataset_id, choice, bbox, *, init_req=None, lead_h=24.0, time_req=
         init_t = pick_init(center, init_req)
         region = region.sel(init_time=init_t, method="nearest")
         target = pd.Timedelta(hours=lead_h)
-        if mode == "accum":
+        if acc:
             region = region.sel(lead_time=slice(pd.Timedelta(0), target))
             td = lead_to_td(region["lead_time"])
             dt = _step_seconds(td, first_zero=True)
@@ -677,7 +881,7 @@ def fetch_map(dataset_id, choice, bbox, *, init_req=None, lead_h=24.0, time_req=
         else:
             region = region.sel(lead_time=target, method="nearest")
             valid = pd.Timestamp(init_t) + pd.Timedelta(region["lead_time"].values)
-        tdim, steps, init_out = "lead_time", (region.sizes.get("lead_time", 1) if mode == "accum" else 1), pd.Timestamp(init_t)
+        tdim, steps, init_out = "lead_time", (region.sizes.get("lead_time", 1) if acc else 1), pd.Timestamp(init_t)
     elif kind == "analysis":
         t = np.datetime64(time_req) if time_req is not None else pick_last_time(center)
         region = region.sel(time=t, method="nearest")
@@ -701,7 +905,9 @@ def fetch_map(dataset_id, choice, bbox, *, init_req=None, lead_h=24.0, time_req=
         sel = idxs[i:i + block]
         blk = region.isel(ensemble_member=sel) if "ensemble_member" in region.dims else region
         blk = blk.load()
-        if mode == "accum":
+        if mode == "accum_amt":
+            f = blk[bases[0]].fillna(0).sum("lead_time")
+        elif mode == "accum":
             dtx = xr.DataArray(dt, dims="lead_time")
             f = (blk[bases[0]] * fct * dtx).fillna(0).sum("lead_time")
         elif mode == "wind_speed":
@@ -736,7 +942,9 @@ def fetch_map(dataset_id, choice, bbox, *, init_req=None, lead_h=24.0, time_req=
         mean = np.where(c > 0, s / c, np.nan)
         field = {"mean": mean, "std": np.sqrt(np.maximum(sq / np.maximum(c, 1) - mean ** 2, 0)),
                  "max": mx, "min": mn, "member": mean}[member_mode]
-    res = {"init": init_out, "valid": valid, "field": field, "units": unit, "label": label, "stride": stride,
+    scale, off, unit_out = unit_transform(key, mode, unit, wind_unit)   # unidades usadas no Brasil
+    field = field * scale if member_mode == "std" else field * scale + off  # desvio-padrão não leva deslocamento
+    res = {"init": init_out, "valid": valid, "field": field, "units": unit_out, "label": label, "stride": stride,
            "lat": np.asarray(region[la].values), "lon": np.asarray(region[lo].values), "key": choice,
            "reduction": member_mode if n_mem > 1 else "determinístico", "members": n_mem}
     if mode == "wind_speed":

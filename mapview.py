@@ -12,6 +12,7 @@ import gzip
 import json
 import math
 import pathlib
+import re
 from functools import lru_cache
 
 import numpy as np
@@ -43,11 +44,16 @@ PLOT_CONFIG = {
 }
 
 
+def _is_precip_key(key):
+    k = key.lower()
+    return any(t in k for t in ("precip", "rain", "snowfall", "runoff")) or bool(re.search(r"(?:^|_)tp(?:_|$)", k))
+
+
 def default_colorscale(key):
     k = key.lower()
     if "temp" in k or "dew" in k:
         return "RdYlBu_r"
-    if "precip" in k or "rain" in k or "snow" in k or "water" in k:
+    if _is_precip_key(k) or "snow" in k or "water" in k:
         return _PRECIP
     if "humidity" in k:
         return "YlGnBu"
@@ -222,7 +228,7 @@ def build_map_figure(data, *, title, subtitle="", colorscale=None, theme="Escuro
         if lon[0] > lon[-1]:
             lon, field = lon[::-1], field[:, ::-1]
             u, v = (u[:, ::-1], v[:, ::-1]) if u is not None else (None, None)
-    if ("precip" in key or "rain" in key) and units in ("mm", "mm/h"):
+    if _is_precip_key(key) and units in ("mm", "mm/h"):
         field = np.where(field <= 0.05, np.nan, field)
 
     fin = field[np.isfinite(field)]

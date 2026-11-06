@@ -15,11 +15,13 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 from plotly.colors import qualitative as Q
 from plotly.subplots import make_subplots
 
 import dynamical_core as C
 import mapview as MV
+import maplibre_view as ML
 
 st.set_page_config(page_title="Previsão multi-modelo · dynamical.org", page_icon="🌦️", layout="wide")
 
@@ -39,6 +41,8 @@ REGIONS = {  # (S, N, W, E) aproximadas
     "Oceania": (-50, 0, 110, 180), "EUA (CONUS)": (24, 50, -125, -66), "Brasil": (-35, 6, -75, -33),
 }
 QUALITY = {"Rápida (≈0,75°)": 150_000, "Padrão (≈0,5°)": 600_000, "Alta (nativa)": 1_500_000}
+MAP_SIZE = 720  # lado do painel quadrado do mapa interativo (px)
+VIEWS = ["🧭 Mapa interativo", "📈 Mapa Plotly"]
 DEFAULT_MODELS = ["noaa-gfs-forecast", "ecmwf-aifs-single-forecast", "ecmwf-ifs-ens-forecast-15-day-0-25-degree"]
 DEFAULT_VARS = ["temperature_2m", "wind_speed_10m", "precipitation_surface__acum"]
 PALETTE = list(Q.Plotly) + list(Q.Dark24)
@@ -96,6 +100,9 @@ ss.setdefault("map_quality", "Padrão (≈0,5°)")
 ss.setdefault("map_theme", "Escuro")
 ss.setdefault("map_style", "Suave")
 ss.setdefault("map_palette", "Automática")
+ss.setdefault("map_view", "🧭 Mapa interativo")
+ss.setdefault("map_base", "Escuro (OpenFreeMap)")
+ss.setdefault("map_arrows", True)
 ss.setdefault("map_opacity", 0.94)
 for _k in ("map_robust", "map_borders", "map_labels", "map_land"):
     ss.setdefault(_k, True)
@@ -279,18 +286,24 @@ with tab_ts:
             with st.expander(f"⚠️ {len(bad)} dataset(s) não puderam ser abertos"):
                 for k, v in bad.items():
                     st.write(f"**{C.pretty(k)}** — {v.get('error')}")
+                    if st.button("🩺 Diagnosticar estrutura", key=f"diag_{k}"):
+                        st.code(C.structure_report(k), language="text")
+                st.caption("Dica: se a raiz do dataset não tem grade, marque 'Incluir variáveis de subgrupos' abaixo.")
         union = C.union_vars(okinfos)
         c1, c2 = st.columns([2, 1])
-        use_groups = c1.checkbox("Incluir variáveis em níveis de pressão (grupo `pressure_level`, se existir)",
+        use_groups = c1.checkbox("Incluir variáveis de subgrupos do dataset (ex.: níveis de pressão)",
                                  key="use_groups")
         levels = c2.multiselect("Níveis (hPa)", LEVELS, default=[850, 500], key="levels", disabled=not use_groups)
         if use_groups:
-            ginf = C.inspect_many(list(okinfos), group="pressure_level", workers=ss.workers)
-            union += C.union_vars({k: v for k, v in ginf.items() if v.get("ok")}, group="pressure_level")
-            ng = sum(1 for v in ginf.values() if v.get("ok"))
-            c1.caption(f"{ng} de {len(okinfos)} dataset(s) têm grupo `pressure_level`.")
+            with st.spinner("Procurando subgrupos…"):
+                ginf = C.inspect_groups(sel, workers=ss.workers)
+            for g, dd in ginf.items():
+                union += C.union_vars(dd, group=g)
+            c1.caption("Subgrupos encontrados: " + (", ".join(f"`{g}` ({len(dd)} dataset(s))" for g, dd in ginf.items())
+                                                    or "nenhum"))
         options = [v["key"] for v in union]
-        fmt = {v["key"]: f"{v['key']} — {v['label']} [{v['units']}] · {v['count']}/{len(sel)}" for v in union}
+        fmt = {v["key"]: f"{v['key']} — {v['label']} [{C.unit_label(v['key'], v['units'], ss.wind_unit)}] · {v['count']}/{len(sel)}"
+               for v in union}
         ss.sel_vars = [v for v in ss.get("sel_vars", [d for d in DEFAULT_VARS if d in options]) if v in options]
         vb = st.columns(6)
         vb[0].button("Padrão", on_click=_preset_vars, args=("default", options), **stretch(st.button))
@@ -355,22 +368,31 @@ with tab_map:
     mid = m1.selectbox("Dataset", IDS, format_func=C.pretty, key="map_ds",
                        index=IDS.index("noaa-gfs-forecast") if "noaa-gfs-forecast" in IDS else 0)
     with st.spinner("Lendo metadados…"):
-        minfo = C.inspect_dataset(mid)
-    if not minfo.get("ok"):
-        st.error(f"Não foi possível abrir este dataset: {minfo.get('error')}")
+        root_info = C.inspect_dataset(mid)
+    root_ok = bool(root_info.get("ok"))
+    use_g = m2.checkbox("Incluir variáveis de subgrupos (ex.: níveis de pressão)", key="map_groups")
+    if m2.button("🩺 Diagnosticar estrutura do dataset", key="diag_map"):
+        with st.expander("Estrutura do dataset", expanded=True):
+            st.code(C.structure_report(mid), language="text")
+    groups_info = {}
+    if use_g or not root_ok:
+        for g in C.list_groups(mid):
+            gi = C.inspect_dataset(mid, g)
+            if gi.get("ok"):
+                groups_info[g] = gi
+    minfo = root_info if root_ok else next(iter(groups_info.values()), None)
+    if minfo is None:
+        st.error(f"Não foi possível abrir este dataset: {root_info.get('error')}")
     else:
-        use_g = m2.checkbox("Variáveis em níveis de pressão (grupo `pressure_level`)", key="map_groups")
-        mvars = C.union_vars({mid: minfo})
-        ginfo = None
-        if use_g:
-            ginfo = C.inspect_dataset(mid, "pressure_level")
-            if ginfo.get("ok"):
-                mvars += C.union_vars({mid: ginfo}, group="pressure_level")
-            else:
-                m2.caption("Este dataset não tem grupo `pressure_level`.")
+        if not root_ok:
+            st.warning("A raiz deste dataset não tem grade lat/lon reconhecível; usando as variáveis dos subgrupos: "
+                       + ", ".join(f"`{g}`" for g in groups_info))
+        mvars = C.union_vars({mid: root_info}) if root_ok else []
+        for g, gi in groups_info.items():
+            mvars += C.union_vars({mid: gi}, group=g)
         mvars = [v for v in mvars if not v["key"].startswith("wind_direction_")]
         mopts = [v["key"] for v in mvars]
-        mfmt = {v["key"]: f"{v['key']} — {v['label']} [{v['units']}]" for v in mvars}
+        mfmt = {v["key"]: f"{v['key']} — {v['label']} [{C.unit_label(v['key'], v['units'], ss.wind_unit)}]" for v in mvars}
         default_var = mopts.index("temperature_2m") if "temperature_2m" in mopts else 0
         mkey = f"map_var_{mid}"
         choice = st.selectbox(f"Variável ({len(mopts)} disponíveis)", mopts, index=default_var,
@@ -380,7 +402,7 @@ with tab_map:
                    f" · grade {'regular' if minfo['regular'] else 'curvilínea'} · "
                    f"lat {minfo['lat'][0]:.1f}…{minfo['lat'][1]:.1f}, lon {minfo['lon'][0]:.1f}…{minfo['lon'][1]:.1f}"
                    f" · dados de {minfo.get('t0', '?')[:16]} a {minfo.get('t1', '?')[:16]}")
-        kw = {"init_req": init_request()}
+        kw = {"init_req": init_request(), "wind_unit": ss.wind_unit}
         t1, t2, t3 = st.columns(3)
         if minfo["kind"] == "forecast":
             leads = minfo["leads_h"]
@@ -405,7 +427,8 @@ with tab_map:
         t3.selectbox("Paleta", list(MV.PALETTES), key="map_palette")
         # nível (quando a variável tem dimensão vertical)
         base_name = choice.split("/")[-1]
-        vsrc = (ginfo["vars"] if (choice.startswith("pressure_level/") and ginfo and ginfo.get("ok")) else minfo["vars"])
+        cg = choice.split("/")[0] if "/" in choice else None
+        vsrc = groups_info[cg]["vars"] if cg in groups_info else (root_info["vars"] if root_ok else [])
         vinfo = {v["name"]: v for v in vsrc}
         bname = base_name if base_name in vinfo else (
             "wind_u_" + base_name.split("wind_speed_")[-1] if base_name.startswith("wind_speed_") else base_name)
@@ -438,9 +461,15 @@ with tab_map:
             ap[3].checkbox("Escala robusta (P1–P99)", key="map_robust",
                            help="Ignora valores extremos para realçar o padrão espacial.")
             ap2 = st.columns(3)
-            ap2[0].checkbox("Contorno dos países", key="map_borders")
-            ap2[1].checkbox("Nomes dos países", key="map_labels", help="Aparecem ao dar zoom/escolher uma região.")
-            ap2[2].checkbox("Terra de fundo", key="map_land")
+            ap2[0].selectbox("Mapa-base (visão interativa)", list(ML.BASEMAPS), key="map_base",
+                             help="OpenFreeMap: gratuito, sem chave. 'Simples' funciona sem internet (terra + países).")
+            ap2[1].checkbox("Setas de vento (visão interativa)", key="map_arrows")
+            ap2[2].caption("Tema, contorno, nomes e terra de fundo valem para a visão Plotly; "
+                           "na visão interativa o mapa-base define o tema.")
+            ap3 = st.columns(3)
+            ap3[0].checkbox("Contorno dos países", key="map_borders")
+            ap3[1].checkbox("Nomes dos países", key="map_labels", help="Aparecem ao dar zoom/escolher uma região.")
+            ap3[2].checkbox("Terra de fundo", key="map_land")
         if st.button("🗺️ Gerar mapa", type="primary"):
             run_map(mid, choice, bbox, kw)
 
@@ -454,26 +483,57 @@ with tab_map:
             red = "" if d["members"] == 1 else f" · {d['reduction']} de {d['members']} membros"
             sub = (f"init {d['init']:%d/%m/%Y %HZ} · " if d["init"] is not None else "") + \
                   f"válido {d['valid']:%d/%m/%Y %HZ}{red}"
-            fig = MV.build_map_figure(
-                d, title=f"{C.pretty(mr['mid'])} · {d['label']}", subtitle=sub,
-                colorscale=MV.PALETTES.get(ss.map_palette), theme=ss.map_theme, style=ss.map_style,
-                opacity=ss.map_opacity, borders=ss.map_borders, labels=ss.map_labels, land=ss.map_land,
-                robust=ss.map_robust)
-            try:
-                st.plotly_chart(fig, theme=None, config=MV.PLOT_CONFIG, **stretch(st.plotly_chart))
-            except TypeError:
-                st.plotly_chart(fig, config=MV.PLOT_CONFIG, **stretch(st.plotly_chart))
+            title = f"{C.pretty(mr['mid'])} · {d['label']}"
             f = d["field"]
             note = ""
             if d["stride"] > 1:
                 note += f" · grade reamostrada (a cada {d['stride']} pontos) para caber na memória"
             if d["lat"].ndim == 2 and "u" in d:
                 note += " · em grades curvilíneas as setas seguem os eixos da grade"
-            st.caption(f"min {np.nanmin(f):.3g} · média {np.nanmean(f):.3g} · máx {np.nanmax(f):.3g} {d['units']}{note}"
-                       " · use o ícone de câmera do gráfico para salvar PNG em alta resolução")
-            st.download_button("⬇️ Baixar mapa interativo (HTML)",
-                               fig.to_html(include_plotlyjs="cdn", config=MV.PLOT_CONFIG).encode("utf-8"),
-                               file_name="mapa_previsao.html", mime="text/html")
+            view = st.radio("Visualização", VIEWS, key="map_view", horizontal=True)
+            html = None
+            if view == VIEWS[0]:
+                try:
+                    html, ginfo = ML.build_html(
+                        d, title=title, subtitle=sub, colorscale=MV.PALETTES.get(ss.map_palette),
+                        basemap=ss.map_base, opacity=ss.map_opacity,
+                        resampling="nearest" if ss.map_style == "Pixels" else "linear",
+                        robust=ss.map_robust, show_arrows=ss.map_arrows, size=MAP_SIZE)
+                except Exception as exc:  # noqa
+                    st.error(f"Não foi possível montar o mapa interativo ({type(exc).__name__}: {exc}). "
+                             "Mostrando a visão Plotly.")
+            if html is not None:
+                left, right = st.columns([3, 1])
+                with left:
+                    components.html(html, height=MAP_SIZE + 8)
+                with right:
+                    st.markdown(f"**{C.pretty(mr['mid'])}**")
+                    st.caption(d["label"])
+                    st.caption(sub)
+                    st.metric("Máximo", f"{np.nanmax(f):.3g} {d['units']}")
+                    st.metric("Média", f"{np.nanmean(f):.3g} {d['units']}")
+                    st.metric("Mínimo", f"{np.nanmin(f):.3g} {d['units']}")
+                    st.caption(f"Escala de cores: {ginfo['vmin']:.3g} a {ginfo['vmax']:.3g} {d['units']}"
+                               + (" (P1–P99)" if ss.map_robust else " (mín–máx)"))
+                    st.download_button("⬇️ Baixar mapa (HTML)", html.encode("utf-8"),
+                                       file_name="mapa_previsao.html", mime="text/html")
+                st.caption("Arraste para mover, role para dar zoom, clique para ver o valor." + note +
+                           " · O campo é o do passo/região escolhidos (não é recarregado ao dar zoom).")
+            else:
+                fig = MV.build_map_figure(
+                    d, title=title, subtitle=sub,
+                    colorscale=MV.PALETTES.get(ss.map_palette), theme=ss.map_theme, style=ss.map_style,
+                    opacity=ss.map_opacity, borders=ss.map_borders, labels=ss.map_labels, land=ss.map_land,
+                    robust=ss.map_robust)
+                try:
+                    st.plotly_chart(fig, theme=None, config=MV.PLOT_CONFIG, **stretch(st.plotly_chart))
+                except TypeError:
+                    st.plotly_chart(fig, config=MV.PLOT_CONFIG, **stretch(st.plotly_chart))
+                st.caption(f"min {np.nanmin(f):.3g} · média {np.nanmean(f):.3g} · máx {np.nanmax(f):.3g} {d['units']}{note}"
+                           " · use o ícone de câmera do gráfico para salvar PNG em alta resolução")
+                st.download_button("⬇️ Baixar mapa Plotly (HTML)",
+                                   fig.to_html(include_plotlyjs="cdn", config=MV.PLOT_CONFIG).encode("utf-8"),
+                                   file_name="mapa_previsao_plotly.html", mime="text/html")
 
 
 # --------------------------------------------------------------------------
@@ -535,11 +595,23 @@ with tab_cat:
     with st.spinner("Abrindo…"):
         oi = C.inspect_dataset(one)
     if oi.get("ok"):
-        st.dataframe(pd.DataFrame([{"variável": v["name"], "descrição": v["long_name"], "unidade": v["units"],
+        st.dataframe(pd.DataFrame([{"variável": v["name"], "descrição": v["long_name"], "unidade original": v["units"],
+                                    "unidade exibida": C.unit_label(v["name"], v["units"], ss.wind_unit),
                                     "dimensões": ", ".join(v["dims"])} for v in oi["vars"]]),
                      hide_index=True, **stretch(st.dataframe))
     else:
         st.error(oi.get("error"))
+    with st.spinner("Procurando subgrupos…"):
+        og = C.inspect_groups([one])
+    for g, dd in og.items():
+        with st.expander(f"Subgrupo `{g}` ({len(dd[one]['vars'])} variáveis)"):
+            st.dataframe(pd.DataFrame([{"variável": v["name"], "descrição": v["long_name"],
+                                        "unidade original": v["units"],
+                                        "unidade exibida": C.unit_label(v["name"], v["units"], ss.wind_unit),
+                                        "dimensões": ", ".join(v["dims"])} for v in dd[one]["vars"]]),
+                         hide_index=True, **stretch(st.dataframe))
+    if st.button("🩺 Diagnosticar estrutura deste dataset", key="diag_cat"):
+        st.code(C.structure_report(one), language="text")
 
 
 # --------------------------------------------------------------------------
@@ -554,6 +626,10 @@ dataset aberto (Zarr/Icechunk, leitura lazy): nada é baixado até você clicar 
 aparecem como média e faixa P10–P90, ou como membros. **Derivadas**: velocidade/direção do vento (de u/v) e
 precipitação acumulada (da taxa).
 
+**Unidades (padrão Brasil).** Tudo é convertido na exibição, nos mapas e no CSV: temperatura em °C (de K), chuva em mm
+(de m, kg/m² ou taxas em mm/h), pressão em hPa, nuvens e umidade em %, radiação em W/m² (de J/m² por hora), vento em
+m/s, km/h ou nós (barra lateral). A tabela do catálogo mostra a unidade original e a exibida de cada variável.
+
 **Datasets *virtual*** são otimizados para mapas e baixa latência; séries neles leem muitos pedaços e demoram mais.
 Datasets *time-optimized* são os melhores para séries.
 
@@ -564,7 +640,12 @@ HRDPS: Canadá). Fora do domínio o app avisa e pula o modelo.
 (ECMWF também sob seus termos de uso). Para os demais, consulte a página do dataset em
 [dynamical.org/catalog](https://dynamical.org/catalog).
 
-**Mapa.** Global por padrão e independente de local. Interativo (zoom, arrastar, passar o mouse para ver valores), com tema escuro/claro, campo suave, em pixels ou
+**Mapa interativo (quadrado).** Painel MapLibre no estilo do "Explore" do dynamical.org: mapa-base com zoom e arrastar,
+campo da previsão por cima, legenda, valor sob o mouse/clique, contorno dos países e setas de vento. Mapa-base:
+[OpenFreeMap](https://openfreemap.org) (gratuito, sem chave) ou "Simples (offline)". O campo é o do passo e da região
+escolhidos; dar zoom não busca detalhe extra. A visão **Plotly** continua disponível.
+
+**Mapa Plotly.** Global por padrão e independente de local. Interativo (zoom, arrastar, passar o mouse para ver valores), com tema escuro/claro, campo suave, em pixels ou
 em contornos, setas de vento e contorno de todos os países (resolução ajustada ao zoom). Grades curvilíneas
 (HRRR, HRDPS…) são reprojetadas para lat/lon por vizinho mais próximo só para exibição.
 Limites de países: [Natural Earth](https://www.naturalearthdata.com) (domínio público), embutidos no projeto.
