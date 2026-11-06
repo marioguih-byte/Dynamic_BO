@@ -1,0 +1,12 @@
+# Python >= 3.12 (exigido pelo dynamical-catalog)
+streamlit>=1.40
+plotly>=5.20
+dynamical-catalog>=1.0
+icechunk
+zarr>=3
+xarray
+pandas
+numpy
+matplotlib
+# Opcional: costas e fronteiras nos mapas (sem ele, o mapa sai só com eixos lat/lon)
+# cartopy
