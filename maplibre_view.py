@@ -32,10 +32,11 @@ BASEMAPS = {
     "Simples escuro (offline)": ("simple", None, "dark"),
     "Simples claro (offline)": ("simple", None, "light"),
 }
-ATTRIBUTION = ('<a href="https://openfreemap.org" target="_blank">OpenFreeMap</a> '
-               '© <a href="https://www.openmaptiles.org/" target="_blank">OpenMapTiles</a> '
-               'Dados © <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> · '
-               'Países: Natural Earth')
+ATTRIBUTION_ONLINE = ('<a href="https://openfreemap.org" target="_blank">OpenFreeMap</a> '
+                      '© <a href="https://www.openmaptiles.org/" target="_blank">OpenMapTiles</a> · '
+                      'Dados © <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> · '
+                      'Países: Natural Earth')
+ATTRIBUTION_SIMPLE = 'Países: Natural Earth (domínio público)'
 
 
 # --------------------------------------------------------------------------
@@ -206,11 +207,13 @@ body.light .panel{background:rgba(255,255,255,.90);color:#1b2433;border:1px soli
 #title b{display:block;font-size:13px}
 #title span{display:block;opacity:.75}
 #readout{margin-top:4px;font-variant-numeric:tabular-nums}
-#legend{left:10px;bottom:10px;width:230px}
+#legend{left:10px;bottom:30px;width:220px}
 #bar{height:10px;border-radius:5px;margin:4px 0 2px}
 #ticks{display:flex;justify-content:space-between;font-size:11px;opacity:.85}
 #unit{opacity:.75;font-size:11px}
-#ctrl{right:10px;bottom:38px;display:flex;flex-direction:column;gap:6px;min-width:150px}
+#ctrl{right:10px;bottom:30px;display:flex;flex-direction:column;gap:6px;min-width:150px}
+#attrib{right:8px;bottom:6px;padding:2px 8px;border-radius:8px;font-size:10px;opacity:.9;max-width:94%}
+#attrib a{color:inherit}
 #ctrl label{display:flex;align-items:center;gap:6px;cursor:pointer}
 #ctrl input[type=range]{width:100%}
 #msg{position:absolute;inset:0;display:none;align-items:center;justify-content:center;text-align:center;padding:24px;z-index:9}
@@ -227,6 +230,7 @@ body.dark #msg{background:#0b0f19;color:#e8eef9} body.light #msg{background:#eef
     <label><input id="bordersChk" type="checkbox" checked> Contorno dos países</label>
     <label id="arrowsRow"><input id="arrowsChk" type="checkbox" checked> Setas de vento</label>
   </div>
+  <div id="attrib" class="panel"></div>
   <div id="msg"></div>
 </div>
 <script>
@@ -245,6 +249,7 @@ $("bar").style.background = "linear-gradient(to right," + CFG.stops.join(",") + 
     s.textContent = String(Number((CFG.vmin + (CFG.vmax - CFG.vmin) * i / (n - 1)).toPrecision(3))); t.appendChild(s); }
 })();
 if (!CFG.arrows) $("arrowsRow").style.display = "none";
+$("attrib").innerHTML = CFG.attribution;
 
 function fatal(msg){ const m = $("msg"); m.textContent = msg; m.style.display = "flex"; }
 function note(msg){ $("t2").textContent = CFG.subtitle + " · " + msg; }
@@ -286,10 +291,14 @@ function begin(style, simple){
     fitBoundsOptions: {padding: 16}, dragRotate: false, pitchWithRotate: false, attributionControl: false,
     minZoom: 0, maxZoom: 12});
   if (map.touchZoomRotate && map.touchZoomRotate.disableRotation) map.touchZoomRotate.disableRotation();
-  map.addControl(new maplibregl.AttributionControl({compact: true, customAttribution: CFG.attribution}));
   map.addControl(new maplibregl.NavigationControl({showCompass: false}), "top-right");
   map.on("error", function(e){ if (window.console) console.warn("maplibre:", e && e.error && e.error.message); });
+  let fitted = false;
+  const fit = function(){ try { map.resize(); map.fitBounds(CFG.view, {padding: 24, duration: 0, maxZoom: 9}); } catch (e) {} };
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(function(){ try { map.resize(); } catch (e) {} if (!fitted) fit(); }).observe($("box")); }
   map.on("load", function(){
+    fit(); fitted = true; setTimeout(fit, 400);  // o estilo pode trazer center/zoom próprios: enquadra nos dados
     const first = ((map.getStyle().layers || []).find(l => l.type === "symbol") || {}).id;
     if (simple) {
       map.addSource("land", {type: "geojson", data: CFG.land});
@@ -360,7 +369,8 @@ def build_html(data, *, title, subtitle="", colorscale=None, basemap="Escuro (Op
     stops = ["#%02x%02x%02x" % tuple(int(c) for c in lut[int(round(i * 255 / 8))]) for i in range(9)]
     cfg = {
         "title": title, "subtitle": subtitle, "units": data.get("units", ""), "theme": theme,
-        "basemap": {"kind": kind, "url": url}, "maplibreVersion": MAPLIBRE_VERSION, "attribution": ATTRIBUTION,
+        "basemap": {"kind": kind, "url": url}, "maplibreVersion": MAPLIBRE_VERSION,
+        "attribution": ATTRIBUTION_ONLINE if kind == "style" else ATTRIBUTION_SIMPLE,
         "png": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
         "coords": [[w, n], [e, n], [e, s], [w, s]], "view": [[w, s], [e, n]],
         "vmin": prep["vmin"], "vmax": prep["vmax"], "stops": stops, "opacity": float(opacity),

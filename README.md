@@ -3,6 +3,9 @@
 Descobre automaticamente **todos os datasets** do catálogo (`dynamical_catalog.list()`) e **todas as variáveis**
 de cada um (lidas do próprio dataset). Séries em ponto, mapas interativos, inspetor de catálogo, exportação CSV/HTML.
 
+## Horário
+Tudo em horário de Brasília (America/Sao_Paulo), sempre com a rodada mais recente de cada modelo. O mapa abre no passo mais próximo de agora e as séries marcam "agora".
+
 ## Mapa
 Painel quadrado interativo (MapLibre + OpenFreeMap, sem chave de API) como no "Explore" do dynamical.org, com a visão Plotly como alternativa.
 Global por padrão (sem local fixo); regiões e resolução opcionais. Plotly interativo com tema escuro/claro, campo suave/pixels/contornos, setas de vento, nomes e **contorno de todos os

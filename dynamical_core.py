@@ -94,7 +94,50 @@ def provider_of(dataset_id):
 def pretty(dataset_id):
     label, prefix = provider_of(dataset_id)
     rest = dataset_id[len(prefix):].strip("-").replace("-", " ")
+    rest = re.sub(r"(\d+) (\d+) degree", r"\1,\2°", rest)
+    rest = re.sub(r"(\d+) degree", r"\1°", rest)
+    rest = re.sub(r"(\d+) day\b", r"\1 dias", rest)
+    rest = re.sub(r"(\d+) hour\b", r"\1 h", rest)
+    rest = rest.replace("forecast", "previsão").replace("analysis", "análise")
     return f"{label} · {rest}" if rest else label
+
+
+# --------------------------------------------------------------------------
+# Horário de Brasília (sempre; o fuso é tratado pelo banco de fusos, sem horário de verão desde 2019)
+# --------------------------------------------------------------------------
+try:
+    from zoneinfo import ZoneInfo
+    BR_TZ = ZoneInfo("America/Sao_Paulo")
+except Exception:  # sem tzdata: UTC-3 fixo
+    from datetime import timedelta, timezone
+    BR_TZ = timezone(timedelta(hours=-3))
+WEEKDAYS_PT = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"]
+
+
+def to_brasilia(x):
+    """UTC (ingênuo ou com fuso) -> horário de Brasília ingênuo. Aceita Timestamp, datetime64 ou DatetimeIndex."""
+    if isinstance(x, (pd.Timestamp, np.datetime64)):
+        t = pd.Timestamp(x)
+        t = t.tz_localize("UTC") if t.tzinfo is None else t
+        return t.tz_convert(BR_TZ).tz_localize(None)
+    idx = pd.DatetimeIndex(x)
+    idx = idx.tz_localize("UTC") if idx.tz is None else idx
+    return idx.tz_convert(BR_TZ).tz_localize(None)
+
+
+def now_brasilia():
+    return pd.Timestamp.now(tz=BR_TZ).tz_localize(None)
+
+
+def br_label(utc_ts):
+    """'qui 06/11 15h' (a partir de um horário UTC)."""
+    t = to_brasilia(utc_ts)
+    return f"{WEEKDAYS_PT[t.weekday()]} {t:%d/%m %H}h" + (f"{t:%M}" if t.minute else "")
+
+
+def br_full(utc_ts):
+    t = to_brasilia(utc_ts)
+    return f"{WEEKDAYS_PT[t.weekday()]} {t:%d/%m/%Y %H:%M}"
 
 
 def is_virtual(dataset_id):
@@ -474,6 +517,81 @@ def unit_transform(name, mode, units, wind_unit="m/s"):
     return 1.0, 0.0, _PRETTY_UNITS.get(u, units or "")
 
 
+_H = lambda s: (s.replace("m", " m") if s.endswith("m") and s[:-1].isdigit() else s)  # noqa: E731
+
+
+_GROUP_PT = {"pressure_level": "níveis de pressão"}
+_BARE_PT = {"temperature": "Temperatura", "geopotential": "Geopotencial", "geopotential_height": "Altura geopotencial",
+            "wind_u": "Vento zonal (u)", "wind_v": "Vento meridional (v)", "u_component_of_wind": "Vento zonal (u)",
+            "v_component_of_wind": "Vento meridional (v)", "relative_humidity": "Umidade relativa",
+            "specific_humidity": "Umidade específica", "vertical_velocity": "Velocidade vertical",
+            "dew_point_temperature": "Ponto de orvalho", "wind_speed": "Velocidade do vento"}
+
+
+def label_pt(key, long_name=""):
+    """Nome da variável em português (padrões dos datasets do dynamical.org); cai no nome original se não houver regra."""
+    grp = key.split("/")[0] if "/" in key else None
+    grp = _GROUP_PT.get(grp, grp)
+    k = key.split("/")[-1]
+    acum = k.endswith("__acum")
+    b = k[:-6] if acum else k
+    rules = [
+        (r"^temperature_(\d+)m$", lambda m: f"Temperatura a {m[1]} m"),
+        (r"^temperature_(\d+)hpa$", lambda m: f"Temperatura em {m[1]} hPa"),
+        (r"^dew_point_temperature_(\d+)m$", lambda m: f"Ponto de orvalho a {m[1]} m"),
+        (r"^maximum_temperature_(\d+)m$", lambda m: f"Temperatura máxima a {m[1]} m"),
+        (r"^minimum_temperature_(\d+)m$", lambda m: f"Temperatura mínima a {m[1]} m"),
+        (r"^sea_surface_temperature$", lambda m: "Temperatura da superfície do mar"),
+        (r"^wind_u_(.+)$", lambda m: f"Vento zonal (u) a {_H(m[1])}"),
+        (r"^wind_v_(.+)$", lambda m: f"Vento meridional (v) a {_H(m[1])}"),
+        (r"^wind_speed_(.+)$", lambda m: f"Velocidade do vento a {_H(m[1])}"),
+        (r"^wind_direction_(.+)$", lambda m: f"Direção do vento a {_H(m[1])}"),
+        (r"^wind_gust_.+$", lambda m: "Rajada de vento"),
+        (r"^precipitation_surface$", lambda m: "Precipitação" if acum else "Taxa de precipitação"),
+        (r"^total_precipitation_(\d+)hr$", lambda m: f"Precipitação total em {m[1]} h"),
+        (r"^imerg_tp_(\d+)hr$", lambda m: f"Precipitação IMERG em {m[1]} h"),
+        (r"^experimental_tp_(\d+)hr$", lambda m: f"Precipitação (satélite-radar) em {m[1]} h"),
+        (r"^precipitable_water_atmosphere$", lambda m: "Água precipitável"),
+        (r"^percent_frozen_precipitation_surface$", lambda m: "Precipitação congelada"),
+        (r"^categorical_precipitation_type_surface$", lambda m: "Tipo de precipitação"),
+        (r"^categorical_rain_surface$", lambda m: "Chuva (sim/não)"),
+        (r"^categorical_snow_surface$", lambda m: "Neve (sim/não)"),
+        (r"^categorical_freezing_rain_surface$", lambda m: "Chuva congelante (sim/não)"),
+        (r"^categorical_ice_pellets_surface$", lambda m: "Granizo fino (sim/não)"),
+        (r"^relative_humidity_(\d+)m$", lambda m: f"Umidade relativa a {m[1]} m"),
+        (r"^pressure_surface$", lambda m: "Pressão na superfície"),
+        (r"^pressure_reduced_to_mean_sea_level$", lambda m: "Pressão ao nível do mar"),
+        (r"^pressure_(\d+)m$", lambda m: f"Pressão a {m[1]} m"),
+        (r"^total_cloud_cover.*$", lambda m: "Cobertura total de nuvens"),
+        (r"^high_cloud_cover.*$", lambda m: "Nuvens altas"),
+        (r"^medium_cloud_cover.*$", lambda m: "Nuvens médias"),
+        (r"^low_cloud_cover.*$", lambda m: "Nuvens baixas"),
+        (r"^downward_short_wave_radiation_flux_surface$", lambda m: "Radiação solar incidente (onda curta)"),
+        (r"^downward_long_wave_radiation_flux_surface$", lambda m: "Radiação de onda longa incidente"),
+        (r"^surface_solar_radiation_downwards_(\d+)hr$", lambda m: f"Radiação solar na superfície ({m[1]} h)"),
+        (r"^total_sky_direct_solar_radiation_at_surface_(\d+)hr$", lambda m: f"Radiação solar direta ({m[1]} h)"),
+        (r"^geopotential_height_(\d+)hpa$", lambda m: f"Altura geopotencial em {m[1]} hPa"),
+        (r"^geopotential_height_cloud_ceiling$", lambda m: "Teto de nuvens"),
+        (r"^geopotential_(\d+)$", lambda m: f"Geopotencial em {m[1]} hPa"),
+        (r"^snow_depth.*$", lambda m: "Profundidade de neve"),
+    ]
+    for pat, fn in rules:
+        m = re.match(pat, b)
+        if m:
+            lab = fn(m)
+            if acum and b != "precipitation_surface":
+                lab += " (acumulada)"
+            if acum and b == "precipitation_surface":
+                lab = "Chuva acumulada"
+            return lab + (f" · {grp}" if grp else "")
+    if b in _BARE_PT:
+        return _BARE_PT[b] + (" (acumulada)" if acum else "") + (f" · {grp}" if grp else "")
+    base = (long_name or b).strip()
+    if base.lower() == b.lower() or not base:
+        base = b.replace("_", " ").capitalize()
+    return base + (" (acumulada)" if acum else "") + (f" · {grp}" if grp else "")
+
+
 def unit_label(key, units, wind_unit="m/s"):
     """Rótulo de unidade exibido para uma chave de variável (original ou derivada)."""
     k = key.split("/")[-1]
@@ -522,14 +640,14 @@ def union_vars(infos, group=None):
         units = {v["name"]: v["units"] for v in info["vars"]}
         for v in info["vars"]:
             key = f"{group}/{v['name']}" if group else v["name"]
-            e = raw.setdefault(key, {"key": key, "label": v["long_name"], "units": v["units"], "count": 0,
-                                     "derived": False})
+            e = raw.setdefault(key, {"key": key, "label": label_pt(key, v["long_name"]), "units": v["units"],
+                                     "count": 0, "derived": False})
             e["count"] += 1
-        if not group:
-            for k, d in derived_defs(names, units, info["kind"]).items():
-                e = der.setdefault(k, {"key": k, "label": d["label"], "units": d["units"], "count": 0,
-                                       "derived": True})
-                e["count"] += 1
+        for k, d in derived_defs(names, units, info["kind"]).items():
+            dk = f"{group}/{k}" if group else k
+            e = der.setdefault(dk, {"key": dk, "label": label_pt(dk), "units": d["units"], "count": 0,
+                                    "derived": True})
+            e["count"] += 1
     return [raw[k] for k in sorted(raw)] + [der[k] for k in sorted(der)]
 
 
@@ -683,11 +801,11 @@ def fetch_series(dataset_id, lat, lon, choices, *, init_req=None, horizon_days=7
         for k in keys:
             label_k = f"{g}/{k}" if g else k
             if k in infos:
-                specs.append((label_k, "raw", [k], infos[k]["units"], infos[k]["long_name"], None))
+                specs.append((label_k, "raw", [k], infos[k]["units"], label_pt(label_k, infos[k]["long_name"]), None))
             elif k in ddefs:
                 d = ddefs[k]
                 fct = rate_factor(units.get(d["bases"][0])) if d["mode"] == "accum" else None
-                specs.append((label_k, d["mode"], d["bases"], d["units"], d["label"], fct))
+                specs.append((label_k, d["mode"], d["bases"], d["units"], label_pt(label_k), fct))
             else:
                 out["skipped"].append(label_k)
         if not specs:
@@ -779,15 +897,16 @@ def summarize(arr):
         return np.nanmean(arr, 0), np.nanpercentile(arr, 10, 0), np.nanpercentile(arr, 90, 0)
 
 
-def results_to_dataframe(results, tz_h=0.0, wind_unit="m/s"):
+def results_to_dataframe(results, tz_h=None, wind_unit="m/s"):
     frames = []
     for did, res in results.items():
         for key, meta in res["vars"].items():
             valid = meta.get("valid", res["valid"])
             arr, unit = display_values(meta, meta["data"], wind_unit)
             m, lo, hi = summarize(arr)
+            local = to_brasilia(valid) if tz_h is None else valid + pd.Timedelta(hours=tz_h)
             df = pd.DataFrame({"dataset": did, "init_utc": res["init"], "valid_utc": valid,
-                               "valid_local": valid + pd.Timedelta(hours=tz_h),
+                               ("valid_brasilia" if tz_h is None else "valid_local"): local,
                                "variavel": key, "unidade": unit, "valor": m,
                                "p10": lo if lo is not None else np.nan,
                                "p90": hi if hi is not None else np.nan,
@@ -838,7 +957,8 @@ def _select_extra(obj, level, spatial):
 
 
 def fetch_map(dataset_id, choice, bbox, *, init_req=None, lead_h=24.0, time_req=None,
-              member_mode="mean", member_idx=0, level=None, max_cells=600_000, wind_unit="m/s"):
+              member_mode="mean", member_idx=0, level=None, max_cells=600_000, wind_unit="m/s",
+              valid_req=None):
     """
     Campo 2D em `bbox=(S,N,W,E)`. Para variáveis acumuladas: soma de 0 a lead_h.
     member_mode: mean | std | max | min | member.
@@ -851,10 +971,10 @@ def fetch_map(dataset_id, choice, bbox, *, init_req=None, lead_h=24.0, time_req=
     units = {n: v["units"] for n, v in vi.items()}
     ddefs = derived_defs(set(vi), units, kind)
     if key in vi:
-        mode, bases, unit, label, fct = "raw", [key], vi[key]["units"], vi[key]["long_name"], None
+        mode, bases, unit, label, fct = "raw", [key], vi[key]["units"], label_pt(choice, vi[key]["long_name"]), None
     elif key in ddefs and ddefs[key]["mode"] != "wind_dir":
         d = ddefs[key]
-        mode, bases, unit, label = d["mode"], d["bases"], d["units"], d["label"]
+        mode, bases, unit, label = d["mode"], d["bases"], d["units"], label_pt(choice)
         fct = rate_factor(units.get(bases[0])) if mode == "accum" else None
     else:
         raise KeyError(f"variável '{key}' indisponível para mapa neste dataset")
@@ -872,6 +992,8 @@ def fetch_map(dataset_id, choice, bbox, *, init_req=None, lead_h=24.0, time_req=
     if kind == "forecast":
         init_t = pick_init(center, init_req)
         region = region.sel(init_time=init_t, method="nearest")
+        if valid_req is not None:  # horário válido desejado (UTC) -> passo da rodada realmente usada
+            lead_h = max(0.0, (pd.Timestamp(valid_req) - pd.Timestamp(init_t)) / pd.Timedelta(hours=1))
         target = pd.Timedelta(hours=lead_h)
         if acc:
             region = region.sel(lead_time=slice(pd.Timedelta(0), target))
