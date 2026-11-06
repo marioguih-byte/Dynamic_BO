@@ -98,7 +98,8 @@ def pretty(dataset_id):
     rest = re.sub(r"(\d+) degree", r"\1°", rest)
     rest = re.sub(r"(\d+) day\b", r"\1 dias", rest)
     rest = re.sub(r"(\d+) hour\b", r"\1 h", rest)
-    rest = rest.replace("forecast", "previsão").replace("analysis", "análise")
+    rest = (rest.replace("forecast", "previsão").replace("analysis", "análise")
+            .replace("historical", "histórico").replace("operational", "operacional"))
     return f"{label} · {rest}" if rest else label
 
 
@@ -132,7 +133,8 @@ def now_brasilia():
 def br_label(utc_ts):
     """'qui 06/11 15h' (a partir de um horário UTC)."""
     t = to_brasilia(utc_ts)
-    return f"{WEEKDAYS_PT[t.weekday()]} {t:%d/%m %H}h" + (f"{t:%M}" if t.minute else "")
+    day = f"{t:%d/%m/%Y}" if t.year != now_brasilia().year else f"{t:%d/%m}"
+    return f"{WEEKDAYS_PT[t.weekday()]} {day} {t:%H}h" + (f"{t:%M}" if t.minute else "")
 
 
 def br_full(utc_ts):
@@ -919,30 +921,35 @@ def results_to_dataframe(results, tz_h=None, wind_unit="m/s"):
 # Mapas
 # --------------------------------------------------------------------------
 def _region_slices(ds, bbox, max_cells):
+    """Indexadores (fatias ou listas de índices) da região e fator de reamostragem."""
     s, n, w, e = bbox
     la, lo = coord_names(ds)
     if is_regular(ds):
         lats, lons = np.asarray(ds[la].values, float), np.asarray(ds[lo].values, float)
-        lons_n = norm_lon(lons) if lons.max() > 180 else lons
+        wrapped = lons.max() > 180  # grade 0–360 (ex.: Google WeatherNext)
+        lons_n = norm_lon(lons) if wrapped else lons
         ii = np.where((lats >= s) & (lats <= n))[0]
         jj = np.where((lons_n >= w) & (lons_n <= e))[0]
         if len(ii) == 0 or len(jj) == 0:
             raise OutOfDomain("região fora do domínio do dataset")
-        sl = {la: slice(int(ii.min()), int(ii.max()) + 1), lo: slice(int(jj.min()), int(jj.max()) + 1)}
-        ny, nx = len(ii), len(jj)
-    else:
-        lat2, lon2 = _latlon2d(ds)
-        mask = (lat2 >= s) & (lat2 <= n) & (norm_lon(lon2) >= w) & (norm_lon(lon2) <= e)
-        if not mask.any():
-            raise OutOfDomain("região fora do domínio do dataset")
-        rows, cols = np.where(mask)
-        ydim, xdim = ds[la].dims
-        sl = {ydim: slice(int(rows.min()), int(rows.max()) + 1), xdim: slice(int(cols.min()), int(cols.max()) + 1)}
-        ny, nx = int(rows.max() - rows.min() + 1), int(cols.max() - cols.min() + 1)
+        k = max(1, math.ceil(math.sqrt(len(ii) * len(jj) / max_cells)))
+        step = k if k > 1 else None
+        lat_idx = slice(int(ii.min()), int(ii.max()) + 1, step)
+        if wrapped and (jj.max() - jj.min() + 1) != len(jj):  # a região atravessa o meridiano 0° da grade 0–360
+            lon_idx = jj[np.argsort(lons_n[jj])][::k]
+        else:
+            lon_idx = slice(int(jj.min()), int(jj.max()) + 1, step)
+        return {la: lat_idx, lo: lon_idx}, k
+    lat2, lon2 = _latlon2d(ds)
+    mask = (lat2 >= s) & (lat2 <= n) & (norm_lon(lon2) >= w) & (norm_lon(lon2) <= e)
+    if not mask.any():
+        raise OutOfDomain("região fora do domínio do dataset")
+    rows, cols = np.where(mask)
+    ydim, xdim = ds[la].dims
+    ny, nx = int(rows.max() - rows.min() + 1), int(cols.max() - cols.min() + 1)
     k = max(1, math.ceil(math.sqrt(ny * nx / max_cells)))
-    if k > 1:
-        sl = {d: slice(x.start, x.stop, k) for d, x in sl.items()}
-    return sl, k
+    step = k if k > 1 else None
+    return {ydim: slice(int(rows.min()), int(rows.max()) + 1, step), xdim: slice(int(cols.min()), int(cols.max()) + 1, step)}, k
 
 
 def _select_extra(obj, level, spatial):
@@ -1071,6 +1078,13 @@ def fetch_map(dataset_id, choice, bbox, *, init_req=None, lead_h=24.0, time_req=
            "reduction": member_mode if n_mem > 1 else "determinístico", "members": n_mem}
     if mode == "wind_speed":
         res["u"], res["v"] = u_s / len(idxs), v_s / len(idxs)
-    if res["lon"].ndim == 1 and np.nanmax(res["lon"]) > 180:
-        res["lon"] = norm_lon(res["lon"])
+    if res["lon"].ndim == 1:
+        lon_v = norm_lon(res["lon"]) if np.nanmax(res["lon"]) > 180 else res["lon"]
+        uniq, idx = np.unique(lon_v, return_index=True)  # ordena e remove duplicatas (ex.: 0° e 360°)
+        if not np.array_equal(idx, np.arange(lon_v.size)):
+            res["field"] = res["field"][:, idx]
+            for kk in ("u", "v"):
+                if kk in res:
+                    res[kk] = res[kk][:, idx]
+        res["lon"] = uniq
     return res

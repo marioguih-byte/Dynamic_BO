@@ -103,6 +103,12 @@ def prepare_field(data, robust=True, max_cells=900_000):
     if lat[0] > lat[-1]:
         lat, field = lat[::-1], field[::-1]
         u, v = (u[::-1], v[::-1]) if u is not None else (None, None)
+    if lon.size and lon.max() > 180:  # grade 0–360
+        lon = ((lon + 180.0) % 360.0) - 180.0
+    uniq, idx = np.unique(lon, return_index=True)  # ordena e remove duplicatas (0° e 360°)
+    if not np.array_equal(idx, np.arange(lon.size)):
+        lon, field = uniq, field[:, idx]
+        u, v = (u[:, idx], v[:, idx]) if u is not None else (None, None)
     if lon[0] > lon[-1]:
         lon, field = lon[::-1], field[:, ::-1]
         u, v = (u[:, ::-1], v[:, ::-1]) if u is not None else (None, None)
@@ -121,20 +127,27 @@ def prepare_field(data, robust=True, max_cells=900_000):
     return dict(lat=lat, lon=lon, field=field, u=u, v=v, vmin=vmin, vmax=vmax, stride=k)
 
 
-def field_overlay(prep, lut):
+def field_overlay(prep, lut, smooth=True):
     """PNG do campo, reamostrado em linhas uniformes de Web Mercator, e seus limites (w, s, e, n)."""
     lat, lon, f = prep["lat"], prep["lon"], prep["field"]
     nlat, nlon = f.shape
     dlat = (lat[-1] - lat[0]) / (nlat - 1) if nlat > 1 else 1.0
     dlon = (lon[-1] - lon[0]) / (nlon - 1) if nlon > 1 else 1.0
     south, north = max(lat[0] - dlat / 2, -MERC_MAX), min(lat[-1] + dlat / 2, MERC_MAX)
-    west, east = max(lon[0] - dlon / 2, -180.0), min(lon[-1] + dlon / 2, 180.0)
+    west, east = float(lon[0] - dlon / 2), float(lon[-1] + dlon / 2)  # bordas das células (grade global = 360° exatos)
     ys, yn = float(_merc_y(south)), float(_merc_y(north))
     nrows = int(min(max(round(nlat * (yn - ys) / math.radians(north - south)), 2), 2400))
     yy = yn - (np.arange(nrows) + 0.5) * (yn - ys) / nrows
     lat_r = np.degrees(2 * np.arctan(np.exp(yy)) - math.pi / 2)
-    idx = np.clip(np.rint((lat_r - lat[0]) / dlat).astype(int), 0, nlat - 1)
-    img = f[idx, :]
+    pos = (lat_r - lat[0]) / dlat
+    idx = np.clip(np.rint(pos).astype(int), 0, nlat - 1)
+    img = near = f[idx, :]
+    if smooth and nlat > 1:  # interpolação linear em latitude: sem blocos nas altas latitudes (Mercator estica)
+        i0 = np.clip(np.floor(pos).astype(int), 0, nlat - 1)
+        i1 = np.clip(i0 + 1, 0, nlat - 1)
+        t = np.clip(pos - i0, 0, 1)[:, None]
+        a, b = f[i0, :], f[i1, :]
+        img = np.where(np.isfinite(a) & np.isfinite(b) & np.isfinite(near), a * (1 - t) + b * t, near)
     t = np.clip((img - prep["vmin"]) / (prep["vmax"] - prep["vmin"]), 0, 1)
     rgb = lut[np.nan_to_num(t * 255).round().astype(np.uint8)]
     alpha = np.where(np.isfinite(img), 255, 0).astype(np.uint8)
@@ -312,7 +325,7 @@ function valueAt(lng, lat){
   return data[i * grid.nlon + j];
 }
 function fmt(v){ return isNaN(v) ? "sem dado" : String(Number(v.toPrecision(4))) + (CFG.units ? " " + CFG.units : ""); }
-function coordText(lng, lat){ return lat.toFixed(2) + "°, " + lng.toFixed(2) + "°"; }
+function coordText(lng, lat){ while (lng < -180) lng += 360; while (lng >= 180) lng -= 360; return lat.toFixed(2) + "°, " + lng.toFixed(2) + "°"; }
 function readout(lng, lat){ $("readout").textContent = coordText(lng, lat) + " → " + fmt(valueAt(lng, lat)); }
 
 // ---------- projeção Web Mercator (coordenadas de mundo 0..1)
@@ -459,7 +472,8 @@ function canvasEngine(){
   // ---------- interação: arrastar, zoom (roda, pinça, duplo clique), clique
   function pos(e){ const r = cv.getBoundingClientRect(); return {x: e.clientX - r.left, y: e.clientY - r.top}; }
   function toLngLat(px, py){ const Wd = worldPx();
-    return {lng: ((px - W / 2) / Wd + view.cx) * 360 - 180, lat: invY((py - H / 2) / Wd + view.cy)}; }
+    const wy = (py - H / 2) / Wd + view.cy;
+    return {lng: ((px - W / 2) / Wd + view.cx) * 360 - 180, lat: invY(wy), inside: wy >= 0 && wy <= 1}; }
   function zoomAt(px, py, dz){
     const Wd = worldPx(), wx = (px - W / 2) / Wd + view.cx, wy = (py - H / 2) / Wd + view.cy;
     view.z = clamp(view.z + dz, 0, 11); const Wd2 = worldPx();
@@ -468,6 +482,7 @@ function canvasEngine(){
   function closePopup(){ $("popup").style.display = "none"; }
   function showPopup(px, py){
     const ll = toLngLat(px, py), p = $("popup");
+    if (!ll.inside) { closePopup(); return; }
     p.innerHTML = "<span class='x' id='px'>×</span><b></b><br><span></span>";
     p.querySelector("b").textContent = fmt(valueAt(ll.lng, ll.lat)); p.querySelector("span:last-child").textContent = coordText(ll.lng, ll.lat);
     p.style.left = clamp(px + 12, 4, W - 150) + "px"; p.style.top = clamp(py + 12, 4, H - 70) + "px"; p.style.display = "block";
@@ -490,7 +505,8 @@ function canvasEngine(){
         moved += Math.abs(p.x - prev.x) + Math.abs(p.y - prev.y); ptrs.set(e.pointerId, p); schedule();
       }
     }
-    const ll = toLngLat(p.x, p.y); readout(ll.lng, ll.lat);
+    const ll = toLngLat(p.x, p.y);
+    if (ll.inside) readout(ll.lng, ll.lat); else $("readout").textContent = "fora do mapa";
   });
   function up(e){
     const p = pos(e); const had = ptrs.delete(e.pointerId);
@@ -622,7 +638,7 @@ def build_html(data, *, title, subtitle="", colorscale=None, basemap=DEFAULT_BAS
     prep = prepare_field(data, robust=robust)
     cs = colorscale if colorscale is not None else MV.default_colorscale(data["key"])
     lut = colormap_lut(cs)
-    png, (w, s, e, n) = field_overlay(prep, lut)
+    png, (w, s, e, n) = field_overlay(prep, lut, smooth=resampling != "nearest")
     lat, lon, f = prep["lat"], prep["lon"], prep["field"]
     nlat, nlon = f.shape
     dlat = (lat[-1] - lat[0]) / (nlat - 1) if nlat > 1 else 1.0
@@ -636,7 +652,7 @@ def build_html(data, *, title, subtitle="", colorscale=None, basemap=DEFAULT_BAS
         "basemap": {"kind": kind, "url": url}, "maplibreVersion": MAPLIBRE_VERSION,
         "attribution": ATTRIBUTION_ONLINE if kind == "style" else ATTRIBUTION_OFFLINE,
         "png": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
-        "coords": [[w, n], [e, n], [e, s], [w, s]], "view": [[w, s], [e, n]],
+        "coords": [[w, n], [e, n], [e, s], [w, s]], "view": [[max(w, -180.0), s], [min(e, 180.0), n]],
         "vmin": prep["vmin"], "vmax": prep["vmax"], "stops": stops, "opacity": float(opacity),
         "resampling": resampling, "rings": rings_payload((s, n, w, e)), "labels": labels_payload(), "arrows": arrows,
         "grid": {"lat0": float(lat[0]), "dlat": float(dlat), "nlat": int(nlat), "lon0": float(lon[0]),

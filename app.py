@@ -437,6 +437,9 @@ with tab_map:
                                       format_func=C.br_label, key=f"valid_{mid}_{minfo['t1']}",
                                       help="Padrão: o horário mais próximo de agora. Para chuva acumulada: "
                                            "soma desde o início da rodada até este horário.")
+            if abs(opts[near] - now_utc) > pd.Timedelta(hours=36):
+                t1.caption(f"⚠️ Este modelo não tem previsão para agora (dados de {C.br_label(opts[0])} a "
+                           f"{C.br_label(opts[-1])}); abrindo no horário mais próximo.")
             kw["valid_req"] = picked.to_datetime64()
             kw["lead_h"] = float((picked - init0) / pd.Timedelta(hours=1))
         else:
