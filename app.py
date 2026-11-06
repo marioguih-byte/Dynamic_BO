@@ -26,9 +26,9 @@ import maplibre_view as ML
 
 st.set_page_config(page_title="Previsão · dynamical.org", page_icon="🌦️", layout="wide")
 st.markdown("""<style>
-.block-container{padding-top:1.6rem;max-width:1400px}
+.block-container{padding-top:4.5rem;max-width:1400px}
 [data-testid="stExpander"]{border-radius:12px}
-[data-testid="stSidebar"] .block-container{padding-top:1.2rem}
+[data-testid="stSidebar"] .block-container{padding-top:2rem}
 .muted{color:#8d99ae;font-size:.85rem}
 </style>""", unsafe_allow_html=True)
 
@@ -119,7 +119,7 @@ ss.setdefault("map_theme", "Escuro")
 ss.setdefault("map_style", "Suave")
 ss.setdefault("map_palette", "Automática")
 ss.setdefault("map_view", VIEWS[0])
-ss.setdefault("map_base", "Escuro (OpenFreeMap)")
+ss.setdefault("map_base", ML.DEFAULT_BASEMAP)
 ss.setdefault("map_arrows", True)
 ss.setdefault("map_opacity", 0.9)
 for _k in ("map_robust", "map_borders", "map_labels", "map_land"):
@@ -482,7 +482,8 @@ with tab_map:
             f1, f2, f3, f4 = st.columns(4)
             f1.selectbox("Paleta", list(MV.PALETTES), key="map_palette")
             f2.selectbox("Mapa-base", list(ML.BASEMAPS), key="map_base",
-                         help="OpenFreeMap: gratuito, sem chave. 'Simples' funciona sem internet.")
+                         help="Escuro/Claro: mapa próprio, funciona em qualquer navegador e sem internet. "
+                              "Online: ruas e rótulos do OpenFreeMap; se não carregar, o painel volta sozinho ao modo offline.")
             f3.slider("Opacidade", 0.3, 1.0, step=0.05, key="map_opacity")
             f4.checkbox("Escala robusta (P1–P99)", key="map_robust", help="Ignora valores extremos.")
             g1, g2, g3 = st.columns(3)
