@@ -689,7 +689,7 @@ def fetch_map(dataset_id, choice, bbox, *, init_req=None, lead_h=24.0, time_req=
     n_mem = region.sizes.get("ensemble_member", 1)
     per_member = ny * max(steps, 1) * len(bases)
     if per_member > 4e7:
-        raise MemoryError("região/horizonte grandes demais; reduza a região ou o passo")
+        raise MemoryError("região/horizonte grandes demais; reduza a resolução, a região ou o passo")
     block = max(1, int(2e7 // per_member))
     if member_mode == "member":
         idxs = [min(max(0, int(member_idx)), n_mem - 1)]
@@ -744,66 +744,3 @@ def fetch_map(dataset_id, choice, bbox, *, init_req=None, lead_h=24.0, time_req=
     if res["lon"].ndim == 1 and np.nanmax(res["lon"]) > 180:
         res["lon"] = norm_lon(res["lon"])
     return res
-
-
-def default_cmap(key):
-    k = key.lower()
-    if "temp" in k or "dew" in k:
-        return "RdYlBu_r"
-    if "precip" in k or "rain" in k or "snow" in k or "water" in k or "humidity" in k:
-        return "YlGnBu"
-    if "cloud" in k:
-        return "Greys_r"
-    if "pressure" in k or "geopotential" in k:
-        return "viridis"
-    return "turbo" if "wind" in k else "viridis"
-
-
-def draw_map(fig, data, title, cmap=None, point=None, use_cartopy=True):
-    """Desenha o campo; usa cartopy se disponível (costas/fronteiras), senão eixos simples."""
-    def _plot(with_cartopy):
-        fig.clear()
-        tr, ax = {}, None
-        if with_cartopy:
-            import cartopy.crs as ccrs
-            import cartopy.feature as cfeature
-            ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
-            tr = {"transform": ccrs.PlateCarree()}
-            ax.add_feature(cfeature.COASTLINE, linewidth=0.7)
-            ax.add_feature(cfeature.BORDERS, linewidth=0.4)
-            ax.gridlines(draw_labels=True, linewidth=0.2)
-        else:
-            ax = fig.add_subplot(1, 1, 1)
-            ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
-        field = data["field"]
-        if "precip" in data["key"] and data["units"] in ("mm", "mm/h"):
-            field = np.where(field <= 0.05, np.nan, field)
-        lat, lon = data["lat"], data["lon"]
-        if lat.ndim == 1 and lon.ndim == 1 and lat.size > 1 and lat[0] > lat[-1]:
-            pass  # pcolormesh aceita eixos decrescentes
-        pm = ax.pcolormesh(lon, lat, field, cmap=cmap or default_cmap(data["key"]), shading="auto", **tr)
-        fig.colorbar(pm, ax=ax, shrink=0.8, pad=0.03, label=data["units"])
-        if "u" in data:
-            k = max(1, int(round(max(field.shape) / 25)))
-            if lat.ndim == 1:
-                ax.quiver(lon[::k], lat[::k], data["u"][::k, ::k], data["v"][::k, ::k], width=0.002,
-                          color="k", alpha=0.7, **tr)
-            else:
-                ax.quiver(lon[::k, ::k], lat[::k, ::k], data["u"][::k, ::k], data["v"][::k, ::k], width=0.002,
-                          color="k", alpha=0.7, **tr)
-        if point:
-            ax.plot(point[1], point[0], marker="x", color="red", ms=9, mew=2, **tr)
-        ax.set_title(title, fontsize=10)
-        fig.tight_layout()
-        if with_cartopy:
-            from matplotlib.backends.backend_agg import FigureCanvasAgg
-            FigureCanvasAgg(fig).draw()  # força o uso das feições; se falhar, cai no modo simples
-
-    if use_cartopy:
-        try:
-            _plot(True)
-            return fig
-        except Exception:
-            pass
-    _plot(False)
-    return fig

@@ -7,6 +7,4 @@ zarr>=3
 xarray
 pandas
 numpy
-matplotlib
-# Opcional: costas e fronteiras nos mapas (sem ele, o mapa sai só com eixos lat/lon)
-# cartopy
+scipy

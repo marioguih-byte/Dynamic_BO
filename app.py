@@ -9,34 +9,36 @@ DWD, NASA, UCSB, ECCC...) e TODAS as variáveis de cada um.
     streamlit run app.py
 """
 import inspect
-import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from matplotlib.figure import Figure
 from plotly.colors import qualitative as Q
 from plotly.subplots import make_subplots
 
 import dynamical_core as C
+import mapview as MV
 
 st.set_page_config(page_title="Previsão multi-modelo · dynamical.org", page_icon="🌦️", layout="wide")
 
 CITIES = {
     "Personalizado": None,
-    "Aracaju": (-10.91, -37.07), "Belém": (-1.46, -48.50), "Brasília": (-15.78, -47.93),
-    "Fortaleza": (-3.73, -38.52), "Maceió": (-9.67, -35.74), "Manaus": (-3.12, -60.02),
-    "Porto Alegre": (-30.03, -51.23), "Recife": (-8.05, -34.88), "Rio de Janeiro": (-22.91, -43.17),
-    "Salvador": (-12.97, -38.50), "São Paulo": (-23.55, -46.63),
+    "Brasília": (-15.78, -47.93), "Buenos Aires": (-34.60, -58.38), "Cairo": (30.04, 31.24),
+    "Cidade do México": (19.43, -99.13), "Joanesburgo": (-26.20, 28.05), "Lagos": (6.52, 3.38),
+    "Londres": (51.51, -0.13), "Moscou": (55.76, 37.62), "Nairóbi": (-1.29, 36.82),
+    "Nova Délhi": (28.61, 77.21), "Nova York": (40.71, -74.01), "Pequim": (39.90, 116.41),
+    "São Paulo": (-23.55, -46.63), "Singapura": (1.35, 103.82), "Sydney": (-33.87, 151.21),
+    "Tóquio": (35.68, 139.69),
 }
 REGIONS = {  # (S, N, W, E) aproximadas
-    "Brasil": (-35, 6, -75, -33), "Norte": (-10, 6, -74, -44), "Nordeste": (-18.5, -1, -48, -34),
-    "Centro-Oeste": (-24, -7, -61, -45), "Sudeste": (-25, -14, -53, -39), "Sul": (-34, -22, -58, -47),
-    "América do Sul": (-56, 14, -85, -32), "EUA (CONUS)": (24, 50, -125, -66), "Europa": (35, 70, -12, 35),
-    "Global": (-90, 90, -180, 180), "Ao redor do ponto (raio abaixo)": None,
+    "Global": (-90, 90, -180, 180),
+    "América do Norte": (5, 75, -170, -50), "América do Sul": (-56, 14, -85, -32),
+    "Europa": (34, 72, -25, 45), "África": (-36, 38, -20, 55), "Ásia": (-10, 75, 25, 150),
+    "Oceania": (-50, 0, 110, 180), "EUA (CONUS)": (24, 50, -125, -66), "Brasil": (-35, 6, -75, -33),
 }
+QUALITY = {"Rápida (≈0,75°)": 150_000, "Padrão (≈0,5°)": 600_000, "Alta (nativa)": 1_500_000}
 DEFAULT_MODELS = ["noaa-gfs-forecast", "ecmwf-aifs-single-forecast", "ecmwf-ifs-ens-forecast-15-day-0-25-degree"]
 DEFAULT_VARS = ["temperature_2m", "wind_speed_10m", "precipitation_surface__acum"]
 PALETTE = list(Q.Plotly) + list(Q.Dark24)
@@ -77,9 +79,9 @@ def init_request():
 
 
 # defaults de estado
-ss.setdefault("city", "Brasília")
-ss.setdefault("lat", -15.78)
-ss.setdefault("lon", -47.93)
+ss.setdefault("city", "Personalizado")
+ss.setdefault("lat", 0.0)
+ss.setdefault("lon", 0.0)
 ss.setdefault("tz", -3.0)
 ss.setdefault("latest", True)
 ss.setdefault("init_date", pd.Timestamp.now("UTC").date())
@@ -87,9 +89,16 @@ ss.setdefault("init_hour", 0)
 ss.setdefault("wind_unit", "m/s")
 ss.setdefault("workers", 4)
 ss.setdefault("ens_mode", "faixa P10–P90")
-for k, v in zip(("bb_s", "bb_n", "bb_w", "bb_e"), REGIONS["Brasil"]):
+for k, v in zip(("bb_s", "bb_n", "bb_w", "bb_e"), REGIONS["Global"]):
     ss.setdefault(k, float(v))
-ss.setdefault("map_region", "Brasil")
+ss.setdefault("map_region", "Global")
+ss.setdefault("map_quality", "Padrão (≈0,5°)")
+ss.setdefault("map_theme", "Escuro")
+ss.setdefault("map_style", "Suave")
+ss.setdefault("map_palette", "Automática")
+ss.setdefault("map_opacity", 0.94)
+for _k in ("map_robust", "map_borders", "map_labels", "map_land"):
+    ss.setdefault(_k, True)
 
 
 def _on_city():
@@ -114,11 +123,6 @@ def _on_region():
 with st.sidebar:
     st.title("🌦️ Previsão multi-modelo")
     st.caption("dynamical.org · todos os modelos e variáveis do catálogo")
-    st.subheader("📍 Local")
-    st.selectbox("Cidade", list(CITIES), key="city", on_change=_on_city)
-    c1, c2 = st.columns(2)
-    c1.number_input("Latitude", -90.0, 90.0, step=0.25, format="%.2f", key="lat", on_change=_on_latlon)
-    c2.number_input("Longitude", -180.0, 180.0, step=0.25, format="%.2f", key="lon", on_change=_on_latlon)
     st.subheader("🕒 Tempo")
     st.checkbox("Usar a rodada mais recente com dados", key="latest",
                 help="Em datasets de análise (sem rodada), vale o intervalo recente definido na aba Série.")
@@ -245,6 +249,11 @@ def run_series(sel, choices, init_req, horizon, adays, levels, skip_nocover):
 
 with tab_ts:
     st.caption(f"{len(IDS)} datasets no catálogo · fonte: {SRC}")
+    p1, p2, p3 = st.columns([2, 1, 1])
+    p1.selectbox("📍 Ponto da série", list(CITIES), key="city", on_change=_on_city,
+                 help="A série temporal precisa de um ponto. O mapa (aba ao lado) é global e não usa este ponto.")
+    p2.number_input("Latitude", -90.0, 90.0, step=0.25, format="%.2f", key="lat", on_change=_on_latlon)
+    p3.number_input("Longitude", -180.0, 180.0, step=0.25, format="%.2f", key="lon", on_change=_on_latlon)
     b = st.columns(6)
     b[0].button("⚡ Globais rápidos", on_click=_preset_models, args=("fast",), **stretch(st.button),
                 help="Previsões globais time-optimized (melhores para séries em um ponto).")
@@ -342,7 +351,6 @@ def run_map(mid, choice, bbox, kw):
 
 
 with tab_map:
-    show_pt = True
     m1, m2 = st.columns([2, 1])
     mid = m1.selectbox("Dataset", IDS, format_func=C.pretty, key="map_ds",
                        index=IDS.index("noaa-gfs-forecast") if "noaa-gfs-forecast" in IDS else 0)
@@ -394,8 +402,7 @@ with tab_map:
             kw["member_mode"] = modes[lab]
             if kw["member_mode"] == "member":
                 kw["member_idx"] = t2.number_input("Membro", 0, max(minfo["members"] - 1, 0), 0, key=f"mmem_{mid}")
-        cmap = t3.selectbox("Paleta", ["auto", "viridis", "turbo", "RdYlBu_r", "YlGnBu", "coolwarm", "Greys_r"],
-                            key="map_cmap")
+        t3.selectbox("Paleta", list(MV.PALETTES), key="map_palette")
         # nível (quando a variável tem dimensão vertical)
         base_name = choice.split("/")[-1]
         vsrc = (ginfo["vars"] if (choice.startswith("pressure_level/") and ginfo and ginfo.get("ok")) else minfo["vars"])
@@ -415,16 +422,25 @@ with tab_map:
         r1.selectbox("Região", list(REGIONS), key="map_region", on_change=_on_region)
         with r2:
             cc = st.columns(5)
+            cc[4].selectbox("Resolução", list(QUALITY), key="map_quality",
+                            help="Limita as células por passo (memória). 'Alta' = grade nativa: em mapa global envia ~10 MB ao navegador e demora mais.")
             cc[0].number_input("Sul", -90.0, 90.0, key="bb_s", step=1.0)
             cc[1].number_input("Norte", -90.0, 90.0, key="bb_n", step=1.0)
             cc[2].number_input("Oeste", -180.0, 180.0, key="bb_w", step=1.0)
             cc[3].number_input("Leste", -180.0, 180.0, key="bb_e", step=1.0)
-            radius = cc[4].number_input("Raio (°)", 0.5, 45.0, 5.0, step=0.5)
-        if ss.map_region.startswith("Ao redor"):
-            bbox = (max(LAT - radius, -90), min(LAT + radius, 90), max(LON - radius, -180), min(LON + radius, 180))
-        else:
-            bbox = (min(ss.bb_s, ss.bb_n), max(ss.bb_s, ss.bb_n), min(ss.bb_w, ss.bb_e), max(ss.bb_w, ss.bb_e))
-        show_pt = st.checkbox("Marcar o ponto da barra lateral", value=True)
+        bbox = (min(ss.bb_s, ss.bb_n), max(ss.bb_s, ss.bb_n), min(ss.bb_w, ss.bb_e), max(ss.bb_w, ss.bb_e))
+        kw["max_cells"] = QUALITY[ss.map_quality]
+        with st.expander("🎨 Aparência do mapa", expanded=False):
+            ap = st.columns(4)
+            ap[0].selectbox("Tema", list(MV.THEMES), key="map_theme")
+            ap[1].selectbox("Estilo do campo", ["Suave", "Pixels", "Contornos"], key="map_style")
+            ap[2].slider("Opacidade do campo", 0.3, 1.0, step=0.02, key="map_opacity")
+            ap[3].checkbox("Escala robusta (P1–P99)", key="map_robust",
+                           help="Ignora valores extremos para realçar o padrão espacial.")
+            ap2 = st.columns(3)
+            ap2[0].checkbox("Contorno dos países", key="map_borders")
+            ap2[1].checkbox("Nomes dos países", key="map_labels", help="Aparecem ao dar zoom/escolher uma região.")
+            ap2[2].checkbox("Terra de fundo", key="map_land")
         if st.button("🗺️ Gerar mapa", type="primary"):
             run_map(mid, choice, bbox, kw)
 
@@ -436,20 +452,28 @@ with tab_map:
         else:
             d = mr["data"]
             red = "" if d["members"] == 1 else f" · {d['reduction']} de {d['members']} membros"
-            title = (f"{C.pretty(mr['mid'])} · {d['label']} [{d['units']}]\n"
-                     f"init {d['init']:%d/%m/%Y %HZ}" if d["init"] is not None else
-                     f"{C.pretty(mr['mid'])} · {d['label']} [{d['units']}]\n")
-            title += f" · válido {d['valid']:%d/%m/%Y %HZ}{red}"
-            fig = Figure(figsize=(10, 6.8))
-            C.draw_map(fig, d, title, None if ss.map_cmap == "auto" else ss.map_cmap,
-                       (LAT, LON) if show_pt else None)
-            st.pyplot(fig, **stretch(st.pyplot))
+            sub = (f"init {d['init']:%d/%m/%Y %HZ} · " if d["init"] is not None else "") + \
+                  f"válido {d['valid']:%d/%m/%Y %HZ}{red}"
+            fig = MV.build_map_figure(
+                d, title=f"{C.pretty(mr['mid'])} · {d['label']}", subtitle=sub,
+                colorscale=MV.PALETTES.get(ss.map_palette), theme=ss.map_theme, style=ss.map_style,
+                opacity=ss.map_opacity, borders=ss.map_borders, labels=ss.map_labels, land=ss.map_land,
+                robust=ss.map_robust)
+            try:
+                st.plotly_chart(fig, theme=None, config=MV.PLOT_CONFIG, **stretch(st.plotly_chart))
+            except TypeError:
+                st.plotly_chart(fig, config=MV.PLOT_CONFIG, **stretch(st.plotly_chart))
             f = d["field"]
-            st.caption(f"min {np.nanmin(f):.3g} · média {np.nanmean(f):.3g} · máx {np.nanmax(f):.3g} {d['units']}"
-                       + (f" · grade reamostrada (a cada {d['stride']} pontos) para caber na memória" if d["stride"] > 1 else ""))
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-            st.download_button("⬇️ Baixar PNG", buf.getvalue(), file_name="mapa.png", mime="image/png")
+            note = ""
+            if d["stride"] > 1:
+                note += f" · grade reamostrada (a cada {d['stride']} pontos) para caber na memória"
+            if d["lat"].ndim == 2 and "u" in d:
+                note += " · em grades curvilíneas as setas seguem os eixos da grade"
+            st.caption(f"min {np.nanmin(f):.3g} · média {np.nanmean(f):.3g} · máx {np.nanmax(f):.3g} {d['units']}{note}"
+                       " · use o ícone de câmera do gráfico para salvar PNG em alta resolução")
+            st.download_button("⬇️ Baixar mapa interativo (HTML)",
+                               fig.to_html(include_plotlyjs="cdn", config=MV.PLOT_CONFIG).encode("utf-8"),
+                               file_name="mapa_previsao.html", mime="text/html")
 
 
 # --------------------------------------------------------------------------
@@ -539,6 +563,11 @@ HRDPS: Canadá). Fora do domínio o app avisa e pula o modelo.
 **Atribuição.** Dados processados por dynamical.org. NOAA GFS/GEFS e ECMWF AIFS/IFS ENS aparecem como CC BY 4.0
 (ECMWF também sob seus termos de uso). Para os demais, consulte a página do dataset em
 [dynamical.org/catalog](https://dynamical.org/catalog).
+
+**Mapa.** Global por padrão e independente de local. Interativo (zoom, arrastar, passar o mouse para ver valores), com tema escuro/claro, campo suave, em pixels ou
+em contornos, setas de vento e contorno de todos os países (resolução ajustada ao zoom). Grades curvilíneas
+(HRRR, HRDPS…) são reprojetadas para lat/lon por vizinho mais próximo só para exibição.
+Limites de países: [Natural Earth](https://www.naturalearthdata.com) (domínio público), embutidos no projeto.
 
 **Não incluído:** *Global Airport Observations (ASOS)* é GeoParquet, não Zarr.
 """)
